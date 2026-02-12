@@ -8,12 +8,84 @@ import os
 import argparse
 import numpy as np
 import skimage.io
+import skimage.transform
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import joblib
+from skimage.feature import hog
+from PIL import Image
 
 from selective_search import selective_search
-from feature_utils import FeatureExtractor, box_iou
+
+try:
+    import torch
+    from torchvision import models
+    from torchvision.models import ResNet18_Weights
+except Exception:  # pragma: no cover
+    torch = None
+    models = None
+    ResNet18_Weights = None
+
+
+def extract_hog(image, rect, out_size):
+    x, y, w, h = rect
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    h_img, w_img = image.shape[:2]
+    x2, y2 = min(x + w, w_img), min(y + h, h_img)
+    x, y = max(0, x), max(0, y)
+    if x2 <= x or y2 <= y:
+        return None
+    crop = image[y:y2, x:x2]
+    if crop.size == 0:
+        return None
+    crop = skimage.transform.resize(crop, (out_size, out_size), anti_aliasing=True)
+    feat = hog(
+        crop,
+        orientations=9,
+        pixels_per_cell=(8, 8),
+        cells_per_block=(2, 2),
+        channel_axis=-1,
+        feature_vector=True,
+    )
+    return feat
+
+
+def extract_cnn(image, rect, preprocess, model):
+    x, y, w, h = rect
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    h_img, w_img = image.shape[:2]
+    x2, y2 = min(x + w, w_img), min(y + h, h_img)
+    x, y = max(0, x), max(0, y)
+    if x2 <= x or y2 <= y:
+        return None
+    crop = image[y:y2, x:x2]
+    if crop.size == 0:
+        return None
+    if crop.dtype != np.uint8:
+        crop = (np.clip(crop, 0, 1) * 255).astype(np.uint8)
+    crop_pil = Image.fromarray(crop)
+    with torch.no_grad():
+        inp = preprocess(crop_pil).unsqueeze(0)
+        feat = model(inp).squeeze(0).cpu().numpy()
+    norm = np.linalg.norm(feat)
+    if norm > 1e-12:
+        feat = feat / norm
+    return feat
+
+
+def box_iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union
 
 
 def nms(rects, scores, iou_thresh):
@@ -38,15 +110,15 @@ def main():
     parser.add_argument("--image", required=True, help="Input image path")
     parser.add_argument("--model", default="../results/balloon_svm.joblib")
     parser.add_argument("--out", default="../results/inference.png")
-    parser.add_argument("--scale", type=float, default=300)
+    parser.add_argument("--scale", type=float, default=500)
     parser.add_argument("--sigma", type=float, default=0.8)
-    parser.add_argument("--min_size", type=int, default=50)
+    parser.add_argument("--min_size", type=int, default=20)
     parser.add_argument("--max_merges", type=int, default=None)
     parser.add_argument("--out_size", type=int, default=128)
-    parser.add_argument("--score_thresh", type=float, default=0.0)
-    parser.add_argument("--nms_thresh", type=float, default=0.5)
+    parser.add_argument("--score_thresh", type=float, default=0.5)
+    parser.add_argument("--nms_thresh", type=float, default=0.4)
     parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--feature", choices=["auto", "hog", "cnn"], default="auto")
+    parser.add_argument("--feature", choices=["hog", "cnn"], default="hog")
     args = parser.parse_args()
 
     image = skimage.io.imread(args.image)
@@ -56,16 +128,17 @@ def main():
         image = image[:, :, :3]
 
     clf = joblib.load(args.model)
-    model_dim = int(getattr(clf, "n_features_in_", -1))
-    feature_type = args.feature
-    if feature_type == "auto":
-        if model_dim == 512:
-            feature_type = "cnn"
-        else:
-            feature_type = "hog"
 
-    extractor = FeatureExtractor(feature=feature_type, out_size=args.out_size)
-    print("Using feature extractor:", feature_type)
+    preprocess = None
+    feature_model = None
+    if args.feature == "cnn":
+        if torch is None:
+            raise RuntimeError("PyTorch/torchvision not installed. Install torch and torchvision to use CNN features.")
+        weights = ResNet18_Weights.DEFAULT
+        preprocess = weights.transforms()
+        feature_model = models.resnet18(weights=weights)
+        feature_model.fc = torch.nn.Identity()
+        feature_model.eval()
 
     _, regions = selective_search(
         image, scale=args.scale, sigma=args.sigma, min_size=args.min_size, max_merges=args.max_merges
@@ -75,7 +148,10 @@ def main():
     feats = []
     rects_kept = []
     for r in rects:
-        feat = extractor.extract(image, r, augment=False)
+        if args.feature == "hog":
+            feat = extract_hog(image, r, args.out_size)
+        else:
+            feat = extract_cnn(image, r, preprocess, feature_model)
         if feat is None:
             continue
         feats.append(feat)
@@ -86,19 +162,12 @@ def main():
         return
 
     X = np.array(feats, dtype=np.float32)
-    if model_dim > 0 and X.shape[1] != model_dim:
-        raise RuntimeError(
-            f"Feature dimension mismatch: extracted {X.shape[1]} but model expects {model_dim}. "
-            f"Use --feature {'cnn' if model_dim == 512 else 'hog'} or retrain the model."
-        )
     scores = clf.decision_function(X)
     rects_np = np.array(rects_kept, dtype=np.float32)
-    print("Score stats (min/mean/max):", float(scores.min()), float(scores.mean()), float(scores.max()))
 
     fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6))
     ax.imshow(image)
     count = 0
-    # filter by score and apply NMS
     keep_mask = scores >= args.score_thresh
     rects_f = rects_np[keep_mask]
     scores_f = scores[keep_mask]
